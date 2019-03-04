@@ -17,8 +17,16 @@ import java.nio.charset.CoderResult;
 public abstract class AbstractFileWordList extends AbstractWordList
 {
 
-  /** Default cache percent. */
-  public static final int DEFAULT_CACHE_PERCENT = 5;
+
+  /** Default index size as percent of file size. */
+  public static final int DEFAULT_INDEX_SIZE_PERCENT = 5;
+
+  /**
+   * Default index size as percent of file size
+   * @deprecated renamed to {@link #DEFAULT_INDEX_SIZE_PERCENT}.
+   */
+  @Deprecated
+  public static final int DEFAULT_CACHE_PERCENT = DEFAULT_INDEX_SIZE_PERCENT;
 
   /** File containing words. */
   protected final RandomAccessFile file;
@@ -26,8 +34,8 @@ public abstract class AbstractFileWordList extends AbstractWordList
   /** Number of words in the file. */
   protected int size;
 
-  /** Cache of indexes to file positions. */
-  private Cache cache;
+  /** An index of word indices to their file positions. */
+  private Index index;
 
   /** Charset decoder. */
   private final CharsetDecoder charsetDecoder;
@@ -58,11 +66,11 @@ public abstract class AbstractFileWordList extends AbstractWordList
 
 
   @Override
-  public String get(final int index)
+  public String get(final int i)
   {
-    checkRange(index);
+    checkRange(i);
     try {
-      return readWord(index);
+      return readWord(i);
     } catch (IOException e) {
       throw new RuntimeException("Error reading from file backing word list", e);
     }
@@ -88,74 +96,81 @@ public abstract class AbstractFileWordList extends AbstractWordList
 
 
   /**
-   * Closes the underlying file and make the cache available for garbage collection.
+   * Closes the underlying file and releases the word list resources.
    *
    * @throws  IOException  if an error occurs closing the file
    */
   public void close() throws IOException
   {
-    synchronized (cache) {
+    synchronized (index) {
       file.close();
     }
-    cache = null;
+    index = null;
   }
 
 
   /**
-   * Reads words from the backing file to initialize the word list.
+   * Initializes this word list by reading all words from the backing file,
+   * verifying that they are all ordered according to the comparator order,
+   * counting the total number of words in the list, and constructing
+   * an index for efficiently finding words in the file by their list index.
    *
-   * @param  cachePercent  Percent of file in bytes to use for cache.
+   * @param  indexSizePercent  index size as percentage of file size.
    * @param  allocateDirect  whether buffers should be allocated with {@link ByteBuffer#allocateDirect(int)}
    *
-   * @throws  IllegalArgumentException  if cachePercent is out of range
+   * @throws  IllegalArgumentException  if index size percent is out of range
    *          or the words are not sorted correctly according to the comparator
    * @throws  IOException  on I/O errors reading file data.
    */
-  protected void initialize(final int cachePercent, final boolean allocateDirect) throws IOException
+  protected void initialize(final int indexSizePercent, final boolean allocateDirect) throws IOException
   {
-    cache = new Cache(file.length(), cachePercent, allocateDirect);
+    index = new Index(file.length(), indexSizePercent, allocateDirect);
     FileWord word;
     FileWord prev = null;
-    synchronized (cache) {
+    synchronized (index) {
       seek(0);
       while ((word = readNextWord()) != null) {
         if (prev != null && comparator.compare(word.word, prev.word) < 0) {
           throw new IllegalArgumentException("File is not sorted correctly for this comparator");
         }
         prev = word;
-        cache.put(size++, word.offset);
+        index.put(size++, word.offset);
       }
-      cache.initialized = true;
+      index.initialized = true;
     }
   }
 
 
   /**
-   * Reads the word from the file at the given index of the word list.
+   * Reads the i-th word of the word list from the file.
+   * <p>
+   * The index is used to find the nearest preceding word position that has an index entry,
+   * and from there the words are read sequentially until the i-th one is reached.
    *
-   * @param  index  ith word in the word list
+   * @param  i  ith word in the word list
    *
    * @return  word at the supplied index
    *
    * @throws  IOException  on I/O errors
    */
-  protected String readWord(final int index) throws IOException
+  protected String readWord(final int i) throws IOException
   {
     FileWord word;
-    synchronized (cache) {
-      final Cache.Entry entry = cache.get(index);
-      int i = entry.index;
+    synchronized (index) {
+      final Index.Entry entry = index.get(i);
+      int j = entry.index;
       seek(entry.position);
       do {
         word = readNextWord();
-      } while (i++ < index && word != null);
+      } while (j++ < i && word != null);
       return word != null ? word.word : null;
     }
   }
 
 
   /**
-   * Positions the read head of the backing file at the given byte offset.
+   * Sets the position within the backing file from which
+   * the next next read operation will read data.
    *
    * @param offset byte offset into file.
    *
@@ -173,7 +188,8 @@ public abstract class AbstractFileWordList extends AbstractWordList
 
 
   /**
-   * Fills the buffer from the backing file. This method may be a no-op if the buffer contains all file contents.
+   * Fills the buffer with data from the backing file (from the current read position).
+   * This method may be a no-op if the entire file contents fits in the buffer.
    *
    * @throws  IOException  on I/O errors filling buffer.
    */
@@ -181,9 +197,10 @@ public abstract class AbstractFileWordList extends AbstractWordList
 
 
   /**
-   * Reads the next word from the current position in the backing file.
+   * Reads the word at the current position in the backing file,
+   * and advances the position to the beginning of the following word.
    *
-   * @return  Data structure containing word and byte offset into file where word begins.
+   * @return  the read word and its starting byte offset within the file.
    *
    * @throws  IOException  on I/O errors reading file data.
    */
@@ -219,8 +236,10 @@ public abstract class AbstractFileWordList extends AbstractWordList
 
 
   /**
-   * Determines whether the backing buffer has any more data to read. If the buffer is empty, it attempts
-   * to read from the underlying file and then checks the buffer again.
+   * Returns whether there is additional unread file data available.
+   * <p>
+   * If the buffer does not contain any more unread data, an attempt
+   * is made to read additional data from the file into the buffer.
    *
    * @return  True if there is any more data to read from the buffer, false otherwise.
    *
@@ -241,17 +260,17 @@ public abstract class AbstractFileWordList extends AbstractWordList
   {
     return
       String.format(
-        "%s@%h::size=%s,cache=%s,charsetDecoder=%s",
+        "%s@%h::size=%s,index=%s,charsetDecoder=%s",
         getClass().getName(),
         hashCode(),
         size,
-        cache,
+        index,
         charsetDecoder);
   }
 
 
   /**
-   * Data structure containing word and byte offset into file where word begins in backing file.
+   * Data structure containing a word and its starting offset within the file.
    */
   protected static class FileWord
   {
@@ -279,26 +298,41 @@ public abstract class AbstractFileWordList extends AbstractWordList
   }
 
 
-  /** Cache of word indices to byte offsets where word starts in backing file. */
-  private static class Cache
+  /**
+   * Index of word indices in the word list and their corresponding byte offsets in the backing file.
+   * The index itself is of limited size (specified as a percentage of the total file size), and so
+   * does not contain the position of every word in the list. However, for words that are not in
+   * the index, it can return the offset of the nearest preceding word that is in the index,
+   * and from that position the words can be read sequentially from the file until the desired
+   * word is reached.
+   * <p>
+   * The implementation basically divides the list into equal-sized blocks,
+   * and stores the first word of each block in the index. For any word it is then easy
+   * to calculate which block it belongs to and get the corresponding first entry in the block.
+   * <p>
+   * The index itself is just a buffer of long values, where the i-th value in the buffer is
+   * the file position of the first word in the i-th block of words.
+   */
+  private static class Index
   {
-    /** Cache entry that indicates cached word index and byte offset of start of word in backing file. */
+
+    /** An index entry containing a word index and its starting byte offset in the file. */
     static class Entry
     {
       // CheckStyle:VisibilityModifier OFF
-      /** Cached word index. */
+      /** Word index within the word list. */
       int index;
 
-      /** Byte offset where word starts in backing file. */
+      /** Word starting position in the file. */
       long position;
       // CheckStyle:VisibilityModifier ON
 
 
       /**
-       * Creates a new cache entry.
+       * Creates a new Index entry.
        *
-       * @param  i  Cached word index.
-       * @param  pos  Byte offset where word starts in backing file.
+       * @param  i  word index within the word list.
+       * @param  pos  word starting position in the file.
        */
       Entry(final int i, final long pos)
       {
@@ -310,41 +344,41 @@ public abstract class AbstractFileWordList extends AbstractWordList
     /** Map of word indices to the byte offset in the file where the word starts. */
     private LongBuffer map;
 
-    /** Modulus of indices to cache. */
-    private int modulus;
+    /** Size of block for which there is a representative entry. */
+    private int blockSize;
 
     /** Whether to allocate a direct buffer. */
     private boolean allocateDirect;
 
-    /** Whether this cache is ready for use. */
+    /** Whether this index has been initialized. */
     private boolean initialized;
 
 
     /**
-     * Creates a new cache instance.
+     * Creates a new index instance.
      *
      * @param  fileSize  Size of file in bytes.
-     * @param  cachePercent  Percent of words to cache.
+     * @param  indexSizePercent  index size as percentage of file size
      * @param  direct  Whether to allocate a direct byte buffer.
      *
-     * @throws  IllegalArgumentException  if cachePercent is not between 0-100 or the computed cache size exceeds {@link
-     *                                    Integer#MAX_VALUE}
+     * @throws  IllegalArgumentException  if indexSizePercent is not in the range 0-100
+     *          or if the computed index size exceeds {@link Integer#MAX_VALUE}
      */
-    Cache(final long fileSize, final int cachePercent, final boolean direct)
+    Index(final long fileSize, final int indexSizePercent, final boolean direct)
     {
-      if (cachePercent < 0 || cachePercent > 100) {
-        throw new IllegalArgumentException("cachePercent must be between 0 and 100 inclusive");
+      if (indexSizePercent < 0 || indexSizePercent > 100) {
+        throw new IllegalArgumentException("indexSizePercent must be between 0 and 100 inclusive");
       }
-      final long cacheSize = fileSize * cachePercent / 100;
-      // round up to the next multiple of 8 (size of long)
-      final long bufferSize = (cacheSize | Long.BYTES - 1) + 1;
+      final long indexSize = fileSize * indexSizePercent / 100;
+      // round size up to next multiple of 8 (size of long)
+      final long bufferSize = (indexSize | (Long.BYTES - 1)) + 1;
       if (bufferSize > Integer.MAX_VALUE) {
-        throw new IllegalArgumentException("Cache limit exceeded. Try reducing cacheSize.");
+        throw new IllegalArgumentException("Index size limit exceeded. Try reducing the index size.");
       }
-      final long entries = bufferSize / Long.BYTES;
-      final long words = fileSize / 4;
-      modulus = (int) (words / entries);
+      final long indexEntries = bufferSize / Long.BYTES;
+      final long fileWords = fileSize / 4;
       allocateDirect = direct;
+      blockSize = indexEntries == 0 ? 0 : (int) (fileWords / indexEntries);
       map = allocateDirect
         ? ByteBuffer.allocateDirect((int) bufferSize).asLongBuffer()
         : ByteBuffer.allocate((int) bufferSize).asLongBuffer();
@@ -352,37 +386,37 @@ public abstract class AbstractFileWordList extends AbstractWordList
 
 
     /**
-     * Puts an entry that maps the word at given index to the byte offset in into the backing file. The operation only
-     * succeeds if it is determined that the supplied index should be stored based on the cachePercent, otherwise this
-     * is a no-op.
+     * Adds an index entry that maps a word index within the word list to to its starting position in the file.
+     * This method must be called in the order of the word indices. Depending on the file size and index size,
+     * some entries will actually be added to the index and some will not.
      *
-     * @param  index  Word at index.
+     * @param  i  Word at index.
      * @param  position  Byte offset into backing for file where word starts.
      * @throws IllegalStateException if the cache has already been initialized
      */
-    void put(final int index, final long position)
+    void put(final int i, final long position)
     {
       if (initialized) {
-        throw new IllegalStateException("Cache initialized, put is not allowed");
+        throw new IllegalStateException("Index already initialized, put is not allowed");
       }
-      if (modulus != 0 && index % modulus <= 0) {
+      if (blockSize != 0 && i % blockSize == 0) {
         map.put(position);
       }
     }
 
 
     /**
-     * Gets the byte offset into the backing file for the word at the index that is less than or equal to the supplied
-     * index.
+     * Returns the starting position within the file of the word at the given word list index,
+     * or of the nearest preceding word for which there exists an index entry.
      *
-     * @param  index  Word at index.
+     * @param  i  index within the word list of the requested word.
      *
-     * @return  Nearest cache entry for given index.
+     * @return  the index entry of the word if it exists, or its nearest preceding entry.
      */
-    Entry get(final int index)
+    Entry get(final int i)
     {
-      final int i = modulus == 0 ? 0 : index / modulus;
-      return new Entry(i * modulus, map.get(i));
+      final int j = blockSize == 0 ? 0 : i / blockSize;
+      return new Entry(j * blockSize, map.get(j));
     }
 
 
@@ -391,11 +425,11 @@ public abstract class AbstractFileWordList extends AbstractWordList
     {
       return
         String.format(
-          "%s@%h::size=%s,modulus=%s,allocateDirect=%s,initialized=%s",
+          "%s@%h::size=%s,blockSize=%s,allocateDirect=%s,initialized=%s",
           getClass().getSimpleName(),
           hashCode(),
           map.capacity(),
-          modulus,
+          blockSize,
           allocateDirect,
           initialized);
     }
