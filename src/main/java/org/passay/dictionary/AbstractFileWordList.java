@@ -335,16 +335,19 @@ public abstract class AbstractFileWordList extends AbstractWordList
       if (cachePercent < 0 || cachePercent > 100) {
         throw new IllegalArgumentException("cachePercent must be between 0 and 100 inclusive");
       }
-      allocateDirect = direct;
-      long cacheSize = fileSize * cachePercent / 100;
-      if (cacheSize > 0) {
-        // buffer implementation requires at least 2 longs
-        if (cacheSize < Long.BYTES * 2) {
-          cacheSize = Long.BYTES * 2;
-        }
-        modulus = (int) (fileSize / cacheSize);
-        resize(cacheSize);
+      final long cacheSize = fileSize * cachePercent / 100;
+      // round up to the next multiple of 8 (size of long)
+      final long bufferSize = (cacheSize | Long.BYTES - 1) + 1;
+      if (bufferSize > Integer.MAX_VALUE) {
+        throw new IllegalArgumentException("Cache limit exceeded. Try reducing cacheSize.");
       }
+      final long entries = bufferSize / Long.BYTES;
+      final long words = fileSize / 4;
+      modulus = (int) (words / entries);
+      allocateDirect = direct;
+      map = allocateDirect
+        ? ByteBuffer.allocateDirect((int) bufferSize).asLongBuffer()
+        : ByteBuffer.allocate((int) bufferSize).asLongBuffer();
     }
 
 
@@ -362,15 +365,9 @@ public abstract class AbstractFileWordList extends AbstractWordList
       if (initialized) {
         throw new IllegalStateException("Cache initialized, put is not allowed");
       }
-      if (modulus == 0 || index % modulus > 0) {
-        return;
+      if (modulus != 0 && index % modulus <= 0) {
+        map.put(position);
       }
-      if (map.position() == map.capacity()) {
-        // 12 = 1.5 * 8 since this is a long view of a byte buffer
-        final long newSize = map.capacity() * 12L;
-        resize(newSize);
-      }
-      map.put(position);
     }
 
 
@@ -384,34 +381,8 @@ public abstract class AbstractFileWordList extends AbstractWordList
      */
     Entry get(final int index)
     {
-      if (modulus == 0) {
-        return new Entry(0, 0);
-      }
-      final int i = index / modulus;
+      final int i = modulus == 0 ? 0 : index / modulus;
       return new Entry(i * modulus, map.get(i));
-    }
-
-
-    /**
-     * Creates a new byte buffer of the supplied size for use as the cache. If the cache already exists, it's contents
-     * are copied into the new buffer.
-     *
-     * @param  size  Of byte buffer to create
-     *
-     * @throws  IllegalArgumentException  if size exceeds {@link Integer#MAX_VALUE}
-     */
-    private void resize(final long size)
-    {
-      if (size > Integer.MAX_VALUE) {
-        throw new IllegalArgumentException("Cache limit exceeded. Try reducing cacheSize.");
-      }
-      final LongBuffer temp = allocateDirect ?
-        ByteBuffer.allocateDirect((int) size).asLongBuffer() : ByteBuffer.allocate((int) size).asLongBuffer();
-      if (map != null) {
-        map.rewind();
-        temp.put(map);
-      }
-      map = temp;
     }
 
 
@@ -423,7 +394,7 @@ public abstract class AbstractFileWordList extends AbstractWordList
           "%s@%h::size=%s,modulus=%s,allocateDirect=%s,initialized=%s",
           getClass().getSimpleName(),
           hashCode(),
-          map != null ? map.capacity() : 0,
+          map.capacity(),
           modulus,
           allocateDirect,
           initialized);
